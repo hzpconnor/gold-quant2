@@ -1,51 +1,63 @@
 """
-实盘模拟对接 — 使用 Alpaca Paper Trading API
-免费注册：https://alpaca.markets（选 Paper Trading，无需真实资金）
+黄金量化交易机器人 v3 — 1秒周期实盘模拟（多空双向）
+使用 Alpaca Paper Trading API (WebSocket 实时流)
+
+架构改造要点：
+  1. 周期：日线 → 1秒（每秒评估一次信号）
+  2. 数据：REST历史日线 → WebSocket实时成交流 + 1秒滚动窗口
+  3. 指标：EMA20s / EMA60s / RSI14s / MACD(12,26,9)s（适配秒级）
+  4. 循环：收盘单次触发 → 市场开盘期间每秒触发
+  5. 风控：止损0.5% / 止盈1.0% / 组合回撤15% / 下单冷却10s
+  6. 方向：多空双向，BUY 信号开多，SELL 信号开空
 
 安装依赖：
-    pip install alpaca-trade-api pandas ta pytz
-
-优化点：
-  1. 信号逻辑与 step3 回测一致（SMA20/SMA60/MACD/RSI）
-  2. 市场时间判断，只在 NYSE 开市期间运行
-  3. 收盘后单次触发，不再每60秒盲目轮询
-  4. 波动率动态仓位（step5 逻辑）
-  5. 三层风控：止损5% / 止盈10% / 组合回撤15%
-  6. 日志持久化写入 live_trading.log
-  7. 重复下单保护（检查 pending 订单）
-  8. 分类错误处理（API / 数据 / 订单）
+    pip install alpaca-trade-api pandas ta numpy pytz
 """
 
-import time
+import collections
 import logging
+import queue
+import threading
+import time
 import traceback
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 
-import pandas as pd
 import numpy as np
+import pandas as pd
 import pytz
-
-from ta.trend import SMAIndicator, MACD
 from ta.momentum import RSIIndicator
+from ta.trend import EMAIndicator, MACD
 
-# ─── 配置区 ────────────────────────────────────────────
+# ─── 配置区 ────────────────────────────────────────────────
 API_KEY       = "PKBNJSZCA5OSYU76TM6FJSLS5J"
 API_SECRET    = "4E8kqgmJKY9gauEhMygBa3f8J54wvsspFrzWYZt19kxu"
 BASE_URL      = "https://paper-api.alpaca.markets"
+DATA_FEED     = "iex"       # iex 免费数据源；sip 需付费订阅
 
 SYMBOL        = "GLD"
-STOP_LOSS     = 0.05    # 单笔止损 5%
-TAKE_PROFIT   = 0.10    # 单笔止盈 10%
+INTERVAL_SEC  = 1           # 信号评估周期（秒）
+BUFFER_SIZE   = 300         # 滚动窗口：保留最近 300 秒收盘价
+MIN_BARS      = 80          # 至少积累 N 秒数据后才开始交易
+SEED_BARS     = 200         # 初始化时从历史 1 分钟 bars 预装数量
+
+# 指标窗口（均以秒为单位）
+EMA_SHORT     = 20
+EMA_LONG      = 60
+RSI_WINDOW    = 14
+MACD_FAST     = 12
+MACD_SLOW     = 26
+MACD_SIG      = 9
+
+# 风控参数（日内交易，止损更小）
+STOP_LOSS     = 0.005   # 单笔止损 0.5%
+TAKE_PROFIT   = 0.010   # 单笔止盈 1.0%
 MAX_DRAWDOWN  = 0.15    # 组合最大回撤 15%，触发全平
-TARGET_VOL    = 0.01    # 目标日波动率 1%（动态仓位基准）
-HISTORY_DAYS  = 90      # 拉取近90日日线（保证 SMA60 有足够数据）
-# ────────────────────────────────────────────────────────
+TARGET_VOL    = 0.0001  # 目标秒级波动率（动态仓位基准）
+ORDER_COOLDOWN = 10     # 下单冷却秒数（防抖）
+# ──────────────────────────────────────────────────────────
 
 ET = pytz.timezone("America/New_York")
-MARKET_OPEN  = {"hour": 9,  "minute": 30}
-MARKET_CLOSE = {"hour": 16, "minute": 0}
 
-# ─── 日志配置 ────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -57,7 +69,8 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-# ─── API 初始化 ──────────────────────────────────────────
+# ─── API 工具 ─────────────────────────────────────────────
+
 def get_api():
     try:
         import alpaca_trade_api as tradeapi
@@ -67,130 +80,23 @@ def get_api():
         raise
 
 
-# ─── 市场时间工具 ─────────────────────────────────────────
 def now_et() -> datetime:
     return datetime.now(ET)
 
 
 def is_market_open(api) -> bool:
-    """通过 Alpaca clock 接口判断当前是否处于 NYSE 正市交易时段。"""
     try:
-        clock = api.get_clock()
-        return clock.is_open
+        return api.get_clock().is_open
     except Exception as e:
-        log.warning(f"获取市场时钟失败，默认视为关闭: {e}")
+        log.warning(f"获取市场状态失败: {e}")
         return False
 
 
-def seconds_until_next_close(api) -> float:
-    """返回距下次收盘还有多少秒（用于收盘后触发逻辑）。"""
-    try:
-        clock = api.get_clock()
-        next_close = clock.next_close.replace(tzinfo=timezone.utc).astimezone(ET)
-        now = now_et()
-        return max((next_close - now).total_seconds(), 0)
-    except Exception as e:
-        log.warning(f"获取收盘时间失败: {e}")
-        # 兜底：等到今天 ET 16:05
-        now = now_et()
-        target = now.replace(hour=16, minute=5, second=0, microsecond=0)
-        if now >= target:
-            target += timedelta(days=1)
-        return (target - now).total_seconds()
+def get_account_equity(api) -> tuple[float, float]:
+    acct = api.get_account()
+    return float(acct.equity), float(acct.last_equity)
 
 
-def seconds_until_next_open(api) -> float:
-    """返回距下次开盘还有多少秒。"""
-    try:
-        clock = api.get_clock()
-        next_open = clock.next_open.replace(tzinfo=timezone.utc).astimezone(ET)
-        return max((next_open - now_et()).total_seconds(), 0)
-    except Exception as e:
-        log.warning(f"获取开盘时间失败: {e}")
-        return 3600.0
-
-
-# ─── 数据获取 ─────────────────────────────────────────────
-def get_historical_data(api, symbol: str, days: int = HISTORY_DAYS) -> pd.DataFrame:
-    """拉取近 N 日日线收盘价，返回 DataFrame[Close]。"""
-    end   = datetime.now()
-    start = end - timedelta(days=days)
-    try:
-        bars = api.get_bars(
-            symbol,
-            "1Day",
-            start=start.strftime("%Y-%m-%d"),
-            end=end.strftime("%Y-%m-%d"),
-            feed="iex",
-        ).df
-        if bars.empty:
-            raise ValueError(f"获取到的 {symbol} 数据为空")
-        return bars[["close"]].rename(columns={"close": "Close"})
-    except Exception as e:
-        log.error(f"数据获取失败 [{symbol}]: {e}")
-        raise
-
-
-# ─── 技术指标 & 信号（与 step3 一致）────────────────────────
-def compute_signal(df: pd.DataFrame) -> tuple[str, pd.Series, float]:
-    """
-    信号逻辑（同 step3_backtest.py）：
-      买入：SMA20 > SMA60 AND RSI < 70 AND MACD > MACD_Signal
-      卖出：SMA20 < SMA60 OR RSI > 75 OR MACD < MACD_Signal
-    另外计算 20日波动率用于动态仓位。
-    """
-    df = df.copy()
-    df["SMA_20"]      = SMAIndicator(close=df["Close"], window=20).sma_indicator()
-    df["SMA_60"]      = SMAIndicator(close=df["Close"], window=60).sma_indicator()
-    df["RSI"]         = RSIIndicator(close=df["Close"], window=14).rsi()
-    macd              = MACD(close=df["Close"])
-    df["MACD"]        = macd.macd()
-    df["MACD_Signal"] = macd.macd_signal()
-    df["Return"]      = df["Close"].pct_change()
-    df["Volatility"]  = df["Return"].rolling(20).std()
-    df.dropna(inplace=True)
-
-    if df.empty:
-        raise ValueError("计算指标后数据为空，历史数据不足")
-
-    last = df.iloc[-1]
-    buy  = (last["SMA_20"] > last["SMA_60"]
-            and last["RSI"] < 70
-            and last["MACD"] > last["MACD_Signal"])
-    sell = (last["SMA_20"] < last["SMA_60"]
-            or last["RSI"] > 75
-            or last["MACD"] < last["MACD_Signal"])
-
-    signal = "BUY" if buy else ("SELL" if sell else "HOLD")
-    vol    = float(last["Volatility"]) if last["Volatility"] > 0 else TARGET_VOL
-    return signal, last, vol
-
-
-# ─── 动态仓位计算（step5 逻辑）──────────────────────────────
-def calc_position_size(api, current_vol: float) -> int:
-    """根据波动率和账户净值计算本次应买入股数。"""
-    position_ratio = min(TARGET_VOL / current_vol, 1.0)
-    try:
-        acct  = api.get_account()
-        equity = float(acct.equity)
-    except Exception as e:
-        log.warning(f"获取账户净值失败，默认买1股: {e}")
-        return 1
-
-    try:
-        bars  = api.get_bars(SYMBOL, "1Day", limit=1, feed="iex").df
-        price = float(bars["close"].iloc[-1])
-    except Exception as e:
-        log.warning(f"获取最新价格失败，默认买1股: {e}")
-        return 1
-
-    if price <= 0:
-        return 1
-    qty = int((equity * position_ratio) / price)
-    return max(qty, 1)
-
-
-# ─── 账户 & 持仓查询 ──────────────────────────────────────
 def get_position(api, symbol: str) -> tuple[float, float]:
     try:
         pos = api.get_position(symbol)
@@ -199,175 +105,306 @@ def get_position(api, symbol: str) -> tuple[float, float]:
         return 0.0, 0.0
 
 
-def get_account_equity(api) -> tuple[float, float]:
-    try:
-        acct = api.get_account()
-        return float(acct.equity), float(acct.last_equity)
-    except Exception as e:
-        log.error(f"获取账户信息失败: {e}")
-        raise
-
-
 def has_pending_order(api, symbol: str) -> bool:
-    """检查是否有未成交的挂单，防止重复下单。"""
     try:
-        orders = api.list_orders(status="open", symbols=[symbol])
-        if orders:
-            log.info(f"  存在 {len(orders)} 笔未成交订单，跳过本次下单")
-            return True
-        return False
-    except Exception as e:
-        log.warning(f"查询挂单失败: {e}")
+        return len(api.list_orders(status="open", symbols=[symbol])) > 0
+    except Exception:
         return False
 
 
-# ─── 下单 ────────────────────────────────────────────────
 def place_order(api, symbol: str, qty: int, side: str):
+    """side='buy' 开多或平空；side='sell' 开空或平多。"""
+    try:
+        pos_qty = float(api.get_position(symbol).qty)
+    except Exception:
+        pos_qty = 0.0
+
+    if side == "sell" and pos_qty > 0:
+        # 平多：卖出不超过持仓量
+        qty = min(qty, int(pos_qty))
+    elif side == "buy" and pos_qty < 0:
+        # 平空：买回不超过空仓量
+        qty = min(qty, int(abs(pos_qty)))
+
     try:
         order = api.submit_order(
-            symbol=symbol,
-            qty=qty,
-            side=side,
-            type="market",
-            time_in_force="day",
+            symbol=symbol, qty=qty, side=side,
+            type="market", time_in_force="day",
         )
-        log.info(f"  下单成功: {side.upper()} {qty}股 {symbol} | 订单ID: {order.id}")
+        log.info(f"下单: {side.upper()} {qty}股 {symbol} | ID: {order.id}")
         return order
     except Exception as e:
-        log.error(f"  下单失败 [{side} {qty}股 {symbol}]: {e}")
+        log.error(f"下单失败 [{side} {qty}股 {symbol}]: {e}")
         raise
 
 
-# ─── 单次信号检查 & 执行 ───────────────────────────────────
-def run_once(api, peak_equity: float) -> float:
-    """
-    执行一次完整的信号检查和交易逻辑。
-    peak_equity: 历史最高账户净值，用于组合回撤保护。
-    返回更新后的 peak_equity。
-    """
-    log.info("=" * 55)
-    log.info(f"信号检查 @ {now_et():%Y-%m-%d %H:%M:%S ET}")
-
-    # 账户状态
-    equity, last_equity = get_account_equity(api)
-    peak_equity = max(peak_equity, equity)
-    portfolio_dd = (equity - peak_equity) / peak_equity
-    log.info(f"  账户净值: ${equity:,.2f} | 今日盈亏: ${equity - last_equity:+,.2f} | "
-             f"组合回撤: {portfolio_dd:.2%}")
-
-    # 组合最大回撤保护（先于信号判断）
-    qty, entry = get_position(api, SYMBOL)
-    if qty > 0 and portfolio_dd <= -MAX_DRAWDOWN:
-        log.warning(f"  组合回撤 {portfolio_dd:.2%} 超过 {-MAX_DRAWDOWN:.0%}，强制全平")
-        if not has_pending_order(api, SYMBOL):
-            place_order(api, SYMBOL, int(qty), "sell")
-        return peak_equity
-
-    # 获取数据 & 计算信号
-    df = get_historical_data(api, SYMBOL)
-    signal, last_row, vol = compute_signal(df)
-
-    log.info(
-        f"  收盘价: ${last_row['Close']:.2f} | "
-        f"SMA20: {last_row['SMA_20']:.2f} | SMA60: {last_row['SMA_60']:.2f} | "
-        f"RSI: {last_row['RSI']:.1f} | MACD差: {last_row['MACD'] - last_row['MACD_Signal']:.4f} | "
-        f"波动率: {vol:.4f}"
-    )
-    log.info(f"  策略信号: {signal}")
-
-    qty, entry = get_position(api, SYMBOL)
-    log.info(f"  当前持仓: {qty:.0f}股 | 成本价: ${entry:.2f}")
-
-    # 持仓中：检查止损/止盈/信号平仓
-    if qty > 0:
-        pnl_pct = (last_row["Close"] - entry) / entry
-        log.info(f"  持仓盈亏: {pnl_pct:+.2%}")
-
-        if pnl_pct <= -STOP_LOSS:
-            log.info("  触发止损，平仓")
-            if not has_pending_order(api, SYMBOL):
-                place_order(api, SYMBOL, int(qty), "sell")
-        elif pnl_pct >= TAKE_PROFIT:
-            log.info("  触发止盈，平仓")
-            if not has_pending_order(api, SYMBOL):
-                place_order(api, SYMBOL, int(qty), "sell")
-        elif signal == "SELL":
-            log.info("  信号卖出，平仓")
-            if not has_pending_order(api, SYMBOL):
-                place_order(api, SYMBOL, int(qty), "sell")
-        else:
-            log.info("  持仓中，无操作")
-
-    # 空仓：信号买入
-    elif signal == "BUY":
-        if has_pending_order(api, SYMBOL):
-            return peak_equity
-        trade_qty = calc_position_size(api, vol)
-        log.info(f"  信号买入 {trade_qty}股（动态仓位，波动率={vol:.4f}）")
-        place_order(api, SYMBOL, trade_qty, "buy")
-
-    else:
-        log.info("  空仓等待信号")
-
-    return peak_equity
-
-
-# ─── 主循环 ──────────────────────────────────────────────
-def run_bot():
-    api = get_api()
-
-    log.info("=" * 55)
-    log.info("   黄金量化交易机器人 v2 (Paper Trading)")
-    log.info("=" * 55)
-
-    # 验证 API 连接
+def calc_position_size(equity: float, last_price: float, current_vol: float) -> int:
+    ratio = min(TARGET_VOL / current_vol, 1.0) if current_vol > 0 else 0.1
     try:
-        api.get_account()
-        log.info("API 连接成功")
-    except Exception as e:
-        log.error(f"API 连接失败: {e}")
-        return
-
-    # 初始化历史最高净值（用于组合回撤保护）
-    try:
-        equity, _ = get_account_equity(api)
-        peak_equity = equity
+        return max(int((equity * ratio) / last_price), 1)
     except Exception:
-        peak_equity = 0.0
+        return 1
 
-    while True:
+
+# ─── 指标与信号（秒级） ────────────────────────────────────
+
+def compute_signal(prices: list) -> tuple[str, float, float]:
+    """
+    基于秒级价格序列计算信号。
+    返回: (signal "BUY"/"SELL"/"HOLD", last_price, volatility)
+    """
+    s = pd.Series(prices, dtype=float)
+
+    ema_short = EMAIndicator(close=s, window=EMA_SHORT).ema_indicator()
+    ema_long  = EMAIndicator(close=s, window=EMA_LONG).ema_indicator()
+    rsi       = RSIIndicator(close=s, window=RSI_WINDOW).rsi()
+    macd_obj  = MACD(close=s, window_fast=MACD_FAST, window_slow=MACD_SLOW, window_sign=MACD_SIG)
+    macd_line = macd_obj.macd()
+    macd_sig  = macd_obj.macd_signal()
+
+    last_price = s.iloc[-1]
+    ret_std    = s.pct_change().rolling(20).std().iloc[-1]
+    vol        = float(ret_std) if (ret_std and not np.isnan(ret_std) and ret_std > 0) else TARGET_VOL
+
+    es = float(ema_short.iloc[-1])
+    el = float(ema_long.iloc[-1])
+    rv = float(rsi.iloc[-1])
+    mv = float(macd_line.iloc[-1])
+    ms = float(macd_sig.iloc[-1])
+
+    buy  = (es > el and rv < 70 and mv > ms)
+    sell = (es < el and rv > 30 and mv < ms)   # 三条件同时成立才开空
+
+    signal = "BUY" if buy else ("SELL" if sell else "HOLD")
+    log.info(
+        f"价格={last_price:.4f} | EMA{EMA_SHORT}={es:.4f} EMA{EMA_LONG}={el:.4f} "
+        f"RSI={rv:.1f} MACD差={mv - ms:.6f} vol={vol:.6f} → {signal}"
+    )
+    return signal, last_price, vol
+
+
+# ─── 交易机器人 ───────────────────────────────────────────
+
+class TradingBot:
+    def __init__(self):
+        self.api = get_api()
+        self.price_buffer: collections.deque = collections.deque(maxlen=BUFFER_SIZE)
+        self._price_queue: queue.SimpleQueue = queue.SimpleQueue()  # lock-free, async-safe
+        self.peak_equity: float = 0.0
+        self._cooldown_until: float = 0.0
+
+    # ── 初始化 ──────────────────────────────────────────────
+
+    def seed_buffer(self):
+        """用最近 N 根 1 分钟 bar 的收盘价初始化滚动缓冲区。"""
         try:
-            if not is_market_open(api):
-                # 等到下次开盘
-                wait = seconds_until_next_open(api)
-                log.info(f"市场已关闭，等待 {wait/3600:.1f} 小时至下次开盘...")
-                time.sleep(min(wait, 1800))  # 最多睡30分钟，防止时钟漂移
-                continue
+            bars = self.api.get_bars(
+                SYMBOL, "1Min", limit=SEED_BARS, feed=DATA_FEED
+            ).df
+            if bars.empty:
+                log.warning("历史数据为空，等待实时数据积累...")
+                return
+            for p in bars["close"].values:
+                self.price_buffer.append(float(p))
+            log.info(f"缓冲区预装完成：{len(self.price_buffer)} 条历史 1 分钟 bar")
+        except Exception as e:
+            log.warning(f"缓冲区初始化失败: {e}，将依赖实时数据积累")
 
-            # 市场开着：等到收盘后再执行信号（日线策略）
-            secs_to_close = seconds_until_next_close(api)
-            if secs_to_close > 120:
-                log.info(f"市场开盘中，距收盘还有 {secs_to_close/3600:.2f}h，等待收盘后执行...")
-                # 每30分钟唤醒一次，重新判断（应对提前收盘等特殊情况）
-                time.sleep(min(secs_to_close - 60, 1800))
-                continue
+    # ── WebSocket 数据流（运行于独立线程）──────────────────────
 
-            # 收盘后执行一次信号检查
-            log.info("接近/达到收盘时间，执行今日信号检查...")
-            peak_equity = run_once(api, peak_equity)
+    def _stream_thread(self):
+        """在后台线程中运行 Alpaca WebSocket 实时成交流。"""
+        try:
+            from alpaca_trade_api.stream import Stream
+        except ImportError:
+            log.error("请安装 alpaca-trade-api: pip install alpaca-trade-api")
+            return
 
-            # 等到下次开盘再循环
-            wait = seconds_until_next_open(api)
-            log.info(f"今日执行完毕，等待 {wait/3600:.1f}h 至下次开盘。")
-            time.sleep(min(wait, 1800))
+        async def on_trade(trade):
+            # SimpleQueue.put() never blocks — safe to call from async context
+            self._price_queue.put(float(trade.price))
 
-        except KeyboardInterrupt:
-            log.info("用户中断，程序退出。")
-            break
+        try:
+            stream = Stream(
+                API_KEY, API_SECRET,
+                base_url=BASE_URL,
+                data_feed=DATA_FEED,
+            )
+            stream.subscribe_trades(on_trade, SYMBOL)
+            log.info(f"WebSocket 已连接，订阅 {SYMBOL} 实时成交流...")
+            stream.run()
         except Exception:
-            log.error(f"主循环发生未预期错误:\n{traceback.format_exc()}")
-            log.info("60秒后重试...")
-            time.sleep(60)
+            log.error(f"WebSocket 流中断:\n{traceback.format_exc()}")
+
+    def start_stream(self):
+        t = threading.Thread(target=self._stream_thread, daemon=True, name="ws-stream")
+        t.start()
+        return t
+
+    # ── 1秒聚合 ─────────────────────────────────────────────
+
+    def _flush_second_bar(self):
+        """将当前秒内所有成交价聚合为 1 秒 bar 的收盘价（最后成交价），写入缓冲区。"""
+        last = None
+        while not self._price_queue.empty():
+            last = self._price_queue.get_nowait()
+        if last is not None:
+            self.price_buffer.append(last)
+
+    # ── 信号评估与交易执行 ─────────────────────────────────────
+
+    def _evaluate(self):
+        if len(self.price_buffer) < MIN_BARS:
+            log.debug(f"数据积累中 ({len(self.price_buffer)}/{MIN_BARS})...")
+            return
+
+        prices = list(self.price_buffer)
+        try:
+            signal, last_price, vol = compute_signal(prices)
+        except Exception as e:
+            log.warning(f"指标计算失败: {e}")
+            return
+
+        # 账户净值
+        try:
+            equity, last_equity = get_account_equity(self.api)
+        except Exception as e:
+            log.error(f"获取账户失败: {e}")
+            return
+        self.peak_equity = max(self.peak_equity, equity)
+        port_dd = (equity - self.peak_equity) / self.peak_equity if self.peak_equity > 0 else 0.0
+        log.info(
+            f"净值=${equity:,.2f} 盈亏=${equity - last_equity:+,.2f} "
+            f"回撤={port_dd:.3%} 缓冲区={len(self.price_buffer)}条"
+        )
+
+        qty, entry = get_position(self.api, SYMBOL)
+        pending = has_pending_order(self.api, SYMBOL)  # 只查询一次
+
+        # 组合最大回撤保护：强制全平所有仓位
+        if qty != 0 and port_dd <= -MAX_DRAWDOWN:
+            log.warning(f"组合回撤 {port_dd:.2%} 超限，强制全平")
+            if not pending:
+                close_side = "sell" if qty > 0 else "buy"
+                place_order(self.api, SYMBOL, int(abs(qty)), close_side)
+                self._cooldown_until = time.time() + ORDER_COOLDOWN
+            return
+
+        # ── 多头持仓：止损 / 止盈 / 信号反转 ─────────────────────
+        if qty > 0 and entry > 0:
+            pnl = (last_price - entry) / entry
+            log.info(f"多头持仓 {qty:.0f}股 成本=${entry:.4f} 盈亏={pnl:+.3%}")
+            reason = (
+                f"止损触发 ({pnl:+.3%})，平多" if pnl <= -STOP_LOSS else
+                f"止盈触发 ({pnl:+.3%})，平多" if pnl >= TAKE_PROFIT else
+                "信号反转，平多" if signal == "SELL" else None
+            )
+            if reason:
+                log.info(reason)
+                if not pending:
+                    place_order(self.api, SYMBOL, int(qty), "sell")
+                    self._cooldown_until = time.time() + ORDER_COOLDOWN
+            else:
+                log.info("多头持仓中，无操作")
+
+        # ── 空头持仓：止损 / 止盈 / 信号反转 ─────────────────────
+        elif qty < 0 and entry > 0:
+            pnl = (entry - last_price) / entry   # 价格下跌时盈利为正
+            log.info(f"空头持仓 {abs(qty):.0f}股 成本=${entry:.4f} 盈亏={pnl:+.3%}")
+            reason = (
+                f"止损触发 ({pnl:+.3%})，平空" if pnl <= -STOP_LOSS else
+                f"止盈触发 ({pnl:+.3%})，平空" if pnl >= TAKE_PROFIT else
+                "信号反转，平空" if signal == "BUY" else None
+            )
+            if reason:
+                log.info(reason)
+                if not pending:
+                    place_order(self.api, SYMBOL, int(abs(qty)), "buy")
+                    self._cooldown_until = time.time() + ORDER_COOLDOWN
+            else:
+                log.info("空头持仓中，无操作")
+
+        # ── 空仓：根据信号开多或开空 ───────────────────────────────
+        else:
+            if time.time() < self._cooldown_until:
+                log.info(f"下单冷却中，剩余 {self._cooldown_until - time.time():.0f}s")
+                return
+            if pending:
+                log.info("有挂单，等待成交")
+                return
+
+            if signal == "BUY":
+                trade_qty = calc_position_size(equity, last_price, vol)
+                log.info(f"信号买入，开多 {trade_qty}股（vol={vol:.6f}）")
+                place_order(self.api, SYMBOL, trade_qty, "buy")
+                self._cooldown_until = time.time() + ORDER_COOLDOWN
+            elif signal == "SELL":
+                trade_qty = calc_position_size(equity, last_price, vol)
+                log.info(f"信号卖出，开空 {trade_qty}股（vol={vol:.6f}）")
+                place_order(self.api, SYMBOL, trade_qty, "sell")
+                self._cooldown_until = time.time() + ORDER_COOLDOWN
+            else:
+                log.info("空仓等待信号")
+
+    # ── 主循环 ──────────────────────────────────────────────
+
+    def run(self):
+        log.info("=" * 55)
+        log.info("   黄金量化交易机器人 v3 — 1秒周期 多空双向 (Paper Trading)")
+        log.info("=" * 55)
+
+        # API 连通性验证
+        try:
+            self.api.get_account()
+            log.info("API 连接成功")
+        except Exception as e:
+            log.error(f"API 连接失败: {e}")
+            return
+
+        # 初始化峰值净值
+        try:
+            equity, _ = get_account_equity(self.api)
+            self.peak_equity = equity
+            log.info(f"初始账户净值: ${equity:,.2f}")
+        except Exception as e:
+            log.warning(f"获取初始净值失败: {e}")
+
+        # 预热缓冲区（历史 bar）
+        self.seed_buffer()
+
+        # 启动 WebSocket 后台流
+        self.start_stream()
+        log.info(f"交易循环启动，周期={INTERVAL_SEC}秒，等待数据积累...")
+
+        while True:
+            loop_start = time.monotonic()
+            try:
+                self._flush_second_bar()
+
+                if not is_market_open(self.api):
+                    log.info("市场已关闭，暂停交易，每60秒检查一次...")
+                    time.sleep(60)
+                    continue
+
+                self._evaluate()
+
+            except KeyboardInterrupt:
+                log.info("用户中断，程序退出。")
+                break
+            except Exception:
+                log.error(f"主循环出错:\n{traceback.format_exc()}")
+
+            # 精确控制周期为 INTERVAL_SEC 秒
+            elapsed = time.monotonic() - loop_start
+            sleep_time = max(0.0, INTERVAL_SEC - elapsed)
+            time.sleep(sleep_time)
+
+
+# ─── 入口 ─────────────────────────────────────────────────
+
+def run_bot():
+    bot = TradingBot()
+    bot.run()
 
 
 if __name__ == "__main__":
