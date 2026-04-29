@@ -1,10 +1,12 @@
 import yfinance as yf
+yf.set_tz_cache_location(".yf_cache")
 import pandas as pd
 import numpy as np
 from ta.trend import SMAIndicator, MACD
 from ta.momentum import RSIIndicator
-import matplotlib.pyplot as plt
 import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 matplotlib.rcParams['font.family'] = 'Microsoft YaHei'
 
 # 获取数据
@@ -23,10 +25,13 @@ def backtest(close, short, long, rsi_buy=70, rsi_sell=75):
 
     df["Signal"] = 0
     df.loc[(df["SMA_short"] > df["SMA_long"]) & (df["RSI"] < rsi_buy),  "Signal"] = 1
-    df.loc[(df["SMA_short"] < df["SMA_long"]) | (df["RSI"] > rsi_sell), "Signal"] = 0
+    df.loc[(df["SMA_short"] < df["SMA_long"]) | (df["RSI"] > rsi_sell), "Signal"] = -1
+    
+    # 向前填充持仓状态，1为多头，-1为空仓信号（替换为0）
+    df["Position"] = df["Signal"].replace(0, np.nan).ffill().fillna(0).replace(-1, 0)
 
     df["Return"]   = df["Close"].pct_change()
-    df["Strategy"] = df["Signal"].shift(1) * df["Return"]
+    df["Strategy"] = df["Position"].shift(1) * df["Return"]
 
     cum = (1 + df["Strategy"]).cumprod()
     total_return = cum.iloc[-1] - 1

@@ -1,11 +1,13 @@
 import yfinance as yf
+yf.set_tz_cache_location(".yf_cache")
 import pandas as pd
 import numpy as np
 from ta.trend import SMAIndicator, MACD
 from ta.momentum import RSIIndicator
 from ta.volatility import BollingerBands
-import matplotlib.pyplot as plt
 import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 matplotlib.rcParams['font.family'] = 'Microsoft YaHei'
 
 # 获取数据
@@ -44,7 +46,8 @@ def generate_signal(row):
     return 0
 
 df["Signal"] = df.apply(generate_signal, axis=1)
-df["Position"] = df["Signal"].replace(-1, 0)  # 只做多，不做空
+# 将0替换为NaN以便向前填充，然后将-1（卖出信号）替换为0（空仓）
+df["Position"] = df["Signal"].replace(0, np.nan).ffill().fillna(0).replace(-1, 0)
 
 # 计算收益
 df["Return"]   = df["Close"].pct_change()

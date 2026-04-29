@@ -47,35 +47,41 @@ def backtest_with_risk(df):
         buy_signal  = row["SMA_30"] > row["SMA_40"] and row["RSI"] < 70
         sell_signal = row["SMA_30"] < row["SMA_40"] or row["RSI"] > 75
 
-        # 持仓中检查止损/止盈
+        # 计算当前包含浮动盈亏的净值
+        current_equity = capital
         if position == 1:
             pnl = (price - entry_price) / entry_price
+            current_equity = capital * (1 + pnl * position_size)
+
+        # 持仓中检查止损/止盈
+        if position == 1:
             if pnl <= -STOP_LOSS:
                 position = 0
-                capital *= (1 + pnl * position_size)
+                capital = current_equity
                 trades.append({"date": date, "type": "止损", "pnl": pnl})
             elif pnl >= TAKE_PROFIT:
                 position = 0
-                capital *= (1 + pnl * position_size)
+                capital = current_equity
                 trades.append({"date": date, "type": "止盈", "pnl": pnl})
             elif sell_signal:
                 position = 0
-                capital *= (1 + pnl * position_size)
+                capital = current_equity
                 trades.append({"date": date, "type": "信号平仓", "pnl": pnl})
 
         # 组合最大回撤保护
-        peak = max(peak, capital)
-        portfolio_dd = (capital - peak) / peak
+        peak = max(peak, current_equity)
+        portfolio_dd = (current_equity - peak) / peak
         if portfolio_dd <= -MAX_DRAWDOWN and position == 1:
             position = 0
-            trades.append({"date": date, "type": "回撤保护", "pnl": portfolio_dd})
+            capital = current_equity
+            trades.append({"date": date, "type": "回撤保护", "pnl": pnl})
 
         # 开仓
         if position == 0 and buy_signal:
             position   = 1
             entry_price= price
 
-        equity_curve.append(capital)
+        equity_curve.append(current_equity if position == 1 else capital)
 
     return pd.Series(equity_curve, index=df.index), pd.DataFrame(trades)
 
