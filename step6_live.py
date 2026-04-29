@@ -173,14 +173,16 @@ def compute_signal(prices: list) -> tuple[str, float, float]:
     ms = float(macd_sig.iloc[-1])
 
     buy  = (es > el and rv < 70 and mv > ms)
-    sell = (es < el and rv > 30 and mv < ms)   # 三条件同时成立才开空
+    sell = (es < el and rv > 30 and mv < ms)
+
+    # 增加独立的平仓信号（只要趋势破坏或动量衰竭就平仓）
+    close_long  = (es < el) or (rv > 75) or (mv < ms)
+    close_short = (es > el) or (rv < 25) or (mv > ms)
 
     signal = "BUY" if buy else ("SELL" if sell else "HOLD")
-    log.info(
-        f"价格={last_price:.4f} | EMA{EMA_SHORT}={es:.4f} EMA{EMA_LONG}={el:.4f} "
-        f"RSI={rv:.1f} MACD差={mv - ms:.6f} vol={vol:.6f} → {signal}"
-    )
-    return signal, last_price, vol
+    
+    # 将平仓信号也返回
+    return signal, close_long, close_short, last_price, vol
 
 
 # ─── 交易机器人 ───────────────────────────────────────────
@@ -260,7 +262,7 @@ class TradingBot:
 
         prices = list(self.price_buffer)
         try:
-            signal, last_price, vol = compute_signal(prices)
+            signal, close_long, close_short, last_price, vol = compute_signal(prices)
         except Exception as e:
             log.warning(f"指标计算失败: {e}")
             return
@@ -290,14 +292,15 @@ class TradingBot:
                 self._cooldown_until = time.time() + ORDER_COOLDOWN
             return
 
-        # ── 多头持仓：止损 / 止盈 / 信号反转 ─────────────────────
+        # ── 多头持仓：止损 / 止盈 / 信号反转 / 独立平仓 ─────────────────────
         if qty > 0 and entry > 0:
             pnl = (last_price - entry) / entry
             log.info(f"多头持仓 {qty:.0f}股 成本=${entry:.4f} 盈亏={pnl:+.3%}")
             reason = (
                 f"止损触发 ({pnl:+.3%})，平多" if pnl <= -STOP_LOSS else
                 f"止盈触发 ({pnl:+.3%})，平多" if pnl >= TAKE_PROFIT else
-                "信号反转，平多" if signal == "SELL" else None
+                "信号反转，平多" if signal == "SELL" else
+                "指标走坏，主动平多" if close_long else None
             )
             if reason:
                 log.info(reason)
@@ -307,14 +310,15 @@ class TradingBot:
             else:
                 log.info("多头持仓中，无操作")
 
-        # ── 空头持仓：止损 / 止盈 / 信号反转 ─────────────────────
+        # ── 空头持仓：止损 / 止盈 / 信号反转 / 独立平仓 ─────────────────────
         elif qty < 0 and entry > 0:
             pnl = (entry - last_price) / entry   # 价格下跌时盈利为正
             log.info(f"空头持仓 {abs(qty):.0f}股 成本=${entry:.4f} 盈亏={pnl:+.3%}")
             reason = (
                 f"止损触发 ({pnl:+.3%})，平空" if pnl <= -STOP_LOSS else
                 f"止盈触发 ({pnl:+.3%})，平空" if pnl >= TAKE_PROFIT else
-                "信号反转，平空" if signal == "BUY" else None
+                "信号反转，平空" if signal == "BUY" else
+                "指标走坏，主动平空" if close_short else None
             )
             if reason:
                 log.info(reason)
