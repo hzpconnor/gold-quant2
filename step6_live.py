@@ -53,7 +53,9 @@ STOP_LOSS     = 0.005   # 单笔止损 0.5%
 TAKE_PROFIT   = 0.010   # 单笔止盈 1.0%
 MAX_DRAWDOWN  = 0.15    # 组合最大回撤 15%，触发全平
 TARGET_VOL    = 0.0001  # 目标秒级波动率（动态仓位基准）
-ORDER_COOLDOWN = 10     # 下单冷却秒数（防抖）
+ORDER_COOLDOWN = 60     # 下单冷却秒数（由10s增加到60s，显著降低频率）
+MIN_HOLD_SEC   = 30     # 最小持仓秒数，防止秒级反转平仓
+SIGNAL_STREAK  = 3      # 信号必须连续出现 N 秒才执行，过滤瞬时噪音
 # ──────────────────────────────────────────────────────────
 
 ET = pytz.timezone("America/New_York")
@@ -175,9 +177,10 @@ def compute_signal(prices: list) -> tuple[str, float, float]:
     buy  = (es > el and rv < 70 and mv > ms)
     sell = (es < el and rv > 30 and mv < ms)
 
-    # 增加独立的平仓信号（只要趋势破坏或动量衰竭就平仓）
-    close_long  = (es < el) or (rv > 75) or (mv < ms)
-    close_short = (es > el) or (rv < 25) or (mv > ms)
+    # 增加独立的平仓信号（平仓条件比开仓条件更严格，增加容忍度）
+    # 移除 RSI 过度敏感的平仓，改用更稳健的 EMA 交叉作为趋势破坏信号
+    close_long  = (es < el * 0.9998) or (mv < ms)
+    close_short = (es > el * 1.0002) or (mv > ms)
 
     signal = "BUY" if buy else ("SELL" if sell else "HOLD")
     
@@ -193,7 +196,13 @@ class TradingBot:
         self.price_buffer: collections.deque = collections.deque(maxlen=BUFFER_SIZE)
         self._price_queue: queue.SimpleQueue = queue.SimpleQueue()  # lock-free, async-safe
         self.peak_equity: float = 0.0
+        self.initial_session_equity: float = 0.0  # 本次运行初始净值
         self._cooldown_until: float = 0.0
+        
+        # 改进：记录信号持续时间和持仓开始时间
+        self.last_signal: str = "HOLD"
+        self.signal_count: int = 0
+        self.position_entry_time: float = 0.0
 
     # ── 初始化 ──────────────────────────────────────────────
 
@@ -262,10 +271,22 @@ class TradingBot:
 
         prices = list(self.price_buffer)
         try:
-            signal, close_long, close_short, last_price, vol = compute_signal(prices)
+            raw_signal, close_long, close_short, last_price, vol = compute_signal(prices)
         except Exception as e:
             log.warning(f"指标计算失败: {e}")
             return
+
+        # 改进：信号持续性校验
+        if raw_signal == self.last_signal and raw_signal != "HOLD":
+            self.signal_count += 1
+        else:
+            self.last_signal = raw_signal
+            self.signal_count = 1
+        
+        # 只有信号持续足够长时间，才确认为有效信号
+        signal = raw_signal if self.signal_count >= SIGNAL_STREAK else "HOLD"
+        if raw_signal != "HOLD" and signal == "HOLD":
+            log.debug(f"检测到 {raw_signal} 信号，持续时间 {self.signal_count}/{SIGNAL_STREAK}s")
 
         # 账户净值
         try:
@@ -273,10 +294,17 @@ class TradingBot:
         except Exception as e:
             log.error(f"获取账户失败: {e}")
             return
+        
+        if self.initial_session_equity == 0:
+            self.initial_session_equity = equity
+
         self.peak_equity = max(self.peak_equity, equity)
         port_dd = (equity - self.peak_equity) / self.peak_equity if self.peak_equity > 0 else 0.0
+        session_pnl = equity - self.initial_session_equity
+        
         log.info(
-            f"净值=${equity:,.2f} 盈亏=${equity - last_equity:+,.2f} "
+            f"净值=${equity:,.2f} 本次盈亏=${session_pnl:+,.2f} "
+            f"当日盈亏=${equity - last_equity:+,.2f} "
             f"回撤={port_dd:.3%} 缓冲区={len(self.price_buffer)}条"
         )
 
@@ -295,13 +323,24 @@ class TradingBot:
         # ── 多头持仓：止损 / 止盈 / 信号反转 / 独立平仓 ─────────────────────
         if qty > 0 and entry > 0:
             pnl = (last_price - entry) / entry
-            log.info(f"多头持仓 {qty:.0f}股 成本=${entry:.4f} 盈亏={pnl:+.3%}")
-            reason = (
-                f"止损触发 ({pnl:+.3%})，平多" if pnl <= -STOP_LOSS else
-                f"止盈触发 ({pnl:+.3%})，平多" if pnl >= TAKE_PROFIT else
-                "信号反转，平多" if signal == "SELL" else
-                "指标走坏，主动平多" if close_long else None
-            )
+            hold_time = time.time() - self.position_entry_time
+            log.info(f"多头持仓 {qty:.0f}股 成本=${entry:.4f} 盈亏={pnl:+.3%} 持仓={hold_time:.0f}s")
+            
+            # 改进：增加最小持仓时间保护（除非止损或止盈）
+            is_stop_loss = pnl <= -STOP_LOSS
+            is_take_profit = pnl >= TAKE_PROFIT
+            
+            reason = None
+            if is_stop_loss:
+                reason = f"止损触发 ({pnl:+.3%})，平多"
+            elif is_take_profit:
+                reason = f"止盈触发 ({pnl:+.3%})，平多"
+            elif hold_time >= MIN_HOLD_SEC:
+                if signal == "SELL":
+                    reason = "信号反转，平多"
+                elif close_long:
+                    reason = "指标走坏，主动平多"
+            
             if reason:
                 log.info(reason)
                 if not pending:
@@ -313,13 +352,23 @@ class TradingBot:
         # ── 空头持仓：止损 / 止盈 / 信号反转 / 独立平仓 ─────────────────────
         elif qty < 0 and entry > 0:
             pnl = (entry - last_price) / entry   # 价格下跌时盈利为正
-            log.info(f"空头持仓 {abs(qty):.0f}股 成本=${entry:.4f} 盈亏={pnl:+.3%}")
-            reason = (
-                f"止损触发 ({pnl:+.3%})，平空" if pnl <= -STOP_LOSS else
-                f"止盈触发 ({pnl:+.3%})，平空" if pnl >= TAKE_PROFIT else
-                "信号反转，平空" if signal == "BUY" else
-                "指标走坏，主动平空" if close_short else None
-            )
+            hold_time = time.time() - self.position_entry_time
+            log.info(f"空头持仓 {abs(qty):.0f}股 成本=${entry:.4f} 盈亏={pnl:+.3%} 持仓={hold_time:.0f}s")
+            
+            is_stop_loss = pnl <= -STOP_LOSS
+            is_take_profit = pnl >= TAKE_PROFIT
+
+            reason = None
+            if is_stop_loss:
+                reason = f"止损触发 ({pnl:+.3%})，平空"
+            elif is_take_profit:
+                reason = f"止盈触发 ({pnl:+.3%})，平空"
+            elif hold_time >= MIN_HOLD_SEC:
+                if signal == "BUY":
+                    reason = "信号反转，平空"
+                elif close_short:
+                    reason = "指标走坏，主动平空"
+
             if reason:
                 log.info(reason)
                 if not pending:
@@ -330,6 +379,7 @@ class TradingBot:
 
         # ── 空仓：根据信号开多或开空 ───────────────────────────────
         else:
+            self.position_entry_time = 0.0 # 重置持仓时间
             if time.time() < self._cooldown_until:
                 log.info(f"下单冷却中，剩余 {self._cooldown_until - time.time():.0f}s")
                 return
@@ -341,11 +391,13 @@ class TradingBot:
                 trade_qty = calc_position_size(equity, last_price, vol)
                 log.info(f"信号买入，开多 {trade_qty}股（vol={vol:.6f}）")
                 place_order(self.api, SYMBOL, trade_qty, "buy")
+                self.position_entry_time = time.time()
                 self._cooldown_until = time.time() + ORDER_COOLDOWN
             elif signal == "SELL":
                 trade_qty = calc_position_size(equity, last_price, vol)
                 log.info(f"信号卖出，开空 {trade_qty}股（vol={vol:.6f}）")
                 place_order(self.api, SYMBOL, trade_qty, "sell")
+                self.position_entry_time = time.time()
                 self._cooldown_until = time.time() + ORDER_COOLDOWN
             else:
                 log.info("空仓等待信号")
